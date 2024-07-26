@@ -1,0 +1,309 @@
+---
+title: "YT_topic"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+**THIS SCRIPT WILL NOT WORK WITHOUT API ACCESS**
+##STEP 01: Load libraries and authenticate
+
+```{r}
+
+library(tidyverse)  #General data prep and analysis package
+library(tidytext)   #Text analysis and tidying
+library(tuber)      #YouTube API wrapper for R, used for authenticating accounts and collecting data
+library(re2r)       #Text filtering functions with multi-thread processing capability
+library(quanteda)   #Quantitative text analysis/ML suite w/robust data prep tools - used here for its char_tolower() function
+library(tm)         #For removePunctuation function
+
+
+#Input desired search terms w/operators, upload dates (as needed), type, and language
+##Use operator "AND" between words to return search results related to all terms
+##Use operator "OR" between words to return search results for each unique term in the list
+SEARCH_TERMS = "kamala harris AND (donald trump OR jd vance)"
+  PUBLISHED_AFTER = NULL#"2023-10-26T00:00:00Z"
+  PUBLISHED_BEFORE = NULL#"2023-10-20T00:00:00Z"
+  TYPE = "video"
+  LANG = "en"
+
+
+#Name of your file without .csv - name format is all lowercase, no spaces or punctuation "yourtopicname_MM_DD_YY"
+DATA_PRIM =  as.character(paste(tolower(SEARCH_TERMS) %>% removePunctuation(), "_", format(strptime(lubridate::with_tz(Sys.time()), "%Y-%m-%d %H:%M:%S"), "%m_%d_%y"), sep="")) %>% str_replace_all(" ", "")
+
+
+#Raw data output
+SPREADSHEET = paste(DATA_PRIM, sep="", ".csv") 
+
+
+#Sampled raw data w/ URLs
+RAW_SAMPLE =  paste(DATA_PRIM, sep="", "_RAWSAMPLE.csv") 
+
+
+#Output filtered through a custom word list, no sampling
+FINAL_CSV =   paste(DATA_PRIM, sep="", "_FILTERED.csv")   
+
+
+#Set the number of 24-hour days to filter back from for filtering
+#FILT_DAYS = 30
+
+
+#Authenticates a YouTube account.  If this function won't run, try copy-pasting directly into the terminal and running.  If error still persists, delete the file ".httr-oauth" and try again.
+yt_oauth(Sys.getenv("YT_APP_ID"), 
+         Sys.getenv("YT_APP_SECRET")) 
+
+```
+
+
+##STEP 02: Collect video metadata
+
+```{r}
+
+#Conduct a YouTube search with the specified topic terms to generate video list
+search_results <- yt_search(term = SEARCH_TERMS,
+                            max_results = 50,
+                            channel_id = NULL,
+                            type = "video", #can also return 'channel' or 'playlist'
+                            PUBLISHED_AFTER = PUBLISHED_AFTER,#"2023-10-20T00:00:00Z",
+                            PUBLISHED_BEFORE = PUBLISHED_BEFORE,
+                            relevanceLanguage = LANG)
+
+
+#Rename columns for compatibility with legacy scripts
+colnames(search_results)[1] = "videoId"
+colnames(search_results)[4] = "video_name"
+colnames(search_results)[15] = "title"
+colnames(search_results)[17] = "pubs"
+
+search_results <- search_results %>% select(-c(description))
+  total_videos <- as.character(length(search_results$title))
+
+#Custom function to get full video descriptions from YT metadata
+bind_video_description <- function(data){ #Custom function to get channel names from YT metadata
+  vidids <- unique(data$videoId)
+  descriptions <- data.frame(videoId = data$videoId[1], description = get_video_details(data$videoId[1])$items[[1]]$snippet$description) %>% filter(FALSE)
+  for(i in vidids){
+    tryCatch({
+    print(i)
+    descriptions <- descriptions %>% rbind(data.frame(videoId = i, description = get_video_details(i)$items[[1]]$snippet$description))
+  }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  }
+  return(data %>% left_join(descriptions, by = "videoId")) 
+}
+
+
+#Custom function to get view counts from YT metadata
+mutate_for_views <- function(muta){ #Custom function to get view counts from YT metadata
+  vidids <- unique(muta$videoId)
+  views <- data.frame(videoId = muta$videoId[1], viewCount = get_stats(muta$videoId[1])$viewCount) %>% filter(FALSE)
+  for(i in vidids){
+    tryCatch({
+    print(i)
+    views <- views %>% rbind(data.frame(videoId = i, viewCount = get_stats(i)$viewCount))
+    }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+    }
+  return(muta %>% left_join(views, by = "videoId")) 
+}   
+
+
+#Custom function to get video likes from YT metadata
+mutate_for_vidlikes <- function(muta){ #Custom function to get view counts from YT metadata
+  vidids <- unique(muta$videoId)
+  vlikes <- data.frame(videoId = muta$videoId[1], vidLikeCount = get_stats(muta$videoId[1])$likeCount) %>% filter(FALSE)
+  for(i in vidids){
+    tryCatch({
+    print(i)
+    vlikes <- vlikes %>% rbind(data.frame(videoId = i, vidLikeCount = get_stats(i)$likeCount))
+    }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+    }
+  return(muta %>% left_join(vlikes, by = "videoId")) 
+}   
+
+
+#Apply functions to the video list for later application to the comment data then save results
+search_results <- search_results %>% bind_video_description()
+search_results <- search_results %>% mutate_for_views()
+  search_results$viewCount <- as.numeric(search_results$viewCount)
+search_results <- search_results %>% mutate_for_vidlikes()
+  search_results$vidLikeCount <- as.numeric(search_results$vidLikeCount)
+  search_results <- search_results %>% 
+    mutate(likeToViewRatio = (vidLikeCount / viewCount)*100)
+  search_results$likeToViewRatio <- trunc(search_results$likeToViewRatio*10^4)/10^4
+    search_results$likeToViewRatio <- as.character(search_results$likeToViewRatio)
+    search_results$likeToViewRatio <- paste(search_results$likeToViewRatio, "%", sep="")
+search_results <- search_results %>% unique()
+
+#Generate tidy data frame with only the needed columns, save search results
+vid_meta <- search_results %>% select(videoId, title, description, pubs, viewCount, likeToViewRatio, video_name, vidLikeCount)
+  write_csv(search_results, file=paste(DATA_PRIM, "_SEARCHRESULTS.csv", sep=""))
+
+```
+
+
+##STEP 03: Sort results by desired features and generate matrix of videoIds for scraping
+
+```{r}
+
+#Read in extant search results and apply custom sorting methods as needed
+#search_results <- read_csv(file=paste(DATA_PRIM, "_SEARCHRESULTS.csv", sep="")) 
+
+##**SORTING METHODS: un-hash desired method and run chunk*
+#  search_results <- search_results %>% dplyr::arrange(desc(pubs))             #Sort by newest
+#  search_results <- search_results %>% dplyr::arrange(desc(viewCount))        #Sort by view count
+#  search_results <- search_results %>% slice_sample(n=50)                     #Select a random sample
+#  search_results <- search_results %>% dplyr::arrange(likeToViewRatio)        #like-to-view ratio low to high
+#  search_results <- search_results %>% dplyr::arrange(desc(likeToViewRatio))  #like-to-view ratio high to low
+
+
+#Change n= value to sample the top n videoIds returned by the metadata scrape; n is entered this way for logging purposes later in the script - DO NOT RUN SORTING METHODS IF YOU JUST WANT RESULTS MOST RELEVANT TO SEARCH PARAMETERS
+n=50
+vid_ids <- head(as.matrix(search_results$videoId),
+                n=n)
+
+```
+
+
+**THIS PROCESS MAY TAKE ANYWHERE FROM 10 MINUTES TO 2 HOURS**
+##STEP 04: Scrape raw comment data, append metadata, and write to .csv 
+
+```{r}
+
+#Create an empty data frame and set counter to 1
+vid_data <- data.frame()
+i <- 1
+
+##Apply tuber function get_all_comments to videos included in vid_ids, place them into a temporary data frame to then bind into vid_data
+##error=function(e) allows for the loop to run even after hitting an error; this is an argument of the tryCatch({}) function and is useful for any loop with a high error rate
+##Error 401 means you need to re-authenticate in STEP 01
+##Error 403 means comments were likely disabled for a video or that a video has been removed (if scraping from a legacy list of videoIds)
+##"replacement has 1 row, data has 0" means comments were enabled but nobody commented on that particular video
+for(i in 1:length(vid_ids)){
+  tryCatch({
+    res <- lapply(vid_ids[i], get_all_comments)
+    res_df <- do.call(rbind, lapply(res, data.frame))
+    vid_data <- vid_data %>% rbind(res_df)
+    i = i + 1
+    print(i)
+    write_csv(vid_data, SPREADSHEET)
+  }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+}
+
+```
+
+
+##STEP 05: Sample the raw data set, append comment URLs, and save
+
+```{r}
+
+vid_data <- inner_join(vid_data, vid_meta, by = "videoId") %>% write_csv(file=SPREADSHEET)
+
+#Generate a smaller sample of comments from the raw data w/comment_url column
+sample_dat <- vid_data
+
+if(length(sample_dat$textOriginal) > 9999){
+  sample_dat <- slice_sample(sample_dat, n=10000) 
+} else{
+  sample_dat <- sample_dat
+}
+
+sample_dat <- sample_dat %>%
+  mutate(comment_url = paste("https://www.youtube.com/watch?v=", videoId, "&lc=", id, sep=""))
+
+write_csv(sample_dat, RAW_SAMPLE)
+
+```
+
+
+##STEP 06: Set locale options, process terminology list
+
+```{r}
+
+#Un-hash and change country name as-needed if special language considerations are needed for filtering
+#Sys.setlocale(locale = "English")
+
+library(data.table) #Functions for fast reading data and filtering
+
+#Import a custom word list to filter out specific desired terminology
+terminology <- read_csv("dictionary.csv")
+
+
+  ##If terminology list returns largely benign commentary from one or more terms, remove them from the list here##
+  terminology <- terminology %>% filter(!word %in% c("bad", "poor"))
+
+
+#Collapse term list and add breaks for faster filtering
+char_tolower(terminology$word)
+terminology <- paste("\\b", unlist(terminology$word), "\\b", sep = "")
+terminology <- paste(terminology, collapse="|")
+
+```
+
+
+##STEP 07: Put raw data into new object w/proper formatting and filter 
+
+```{r}
+
+#Import the raw data into a new object for filtering, select filtering time frame options, and extract
+data <- fread(SPREADSHEET, encoding = "UTF-8")
+  #FILTER_DATE <- Sys.Date() - FILT_DAYS 
+  #data <- data[publishedAt >= FILTER_DATE] 
+
+data[, match_term:=re2_extract_all(quanteda::char_tolower(textOriginal), terminology, parallel = TRUE)]
+
+```
+
+
+##STEP 08: Tidy the filtered data
+
+```{r}
+
+#Remove the default character(0) results returned when no match occurs
+data$match_term <- as.character(data$match_term)
+
+data <- data %>% 
+  filter(match_term != "character(0)") 
+
+```
+
+
+##STEP 09: Generate quantitative metrics and comment URLs
+
+```{r}
+
+#Calculate ratio of filtered comments to raw comments as a percentage
+raw_num <- as.numeric(length(vid_data$textOriginal))
+filt_num <- as.numeric(length(data$textOriginal))
+filt_to_raw = round(x = (filt_num/raw_num) * 100, digits = 2) %>% as.character()
+
+
+#Create comment_url column
+data <- data %>%
+  mutate(comment_url = paste0("https://www.youtube.com/watch?v=", videoId, "&lc=", id, sep="")) 
+
+
+#Select desired variables and write to .csv file
+data %>% 
+  select(textOriginal, 
+                comment_url, 
+                authorDisplayName, 
+                title, 
+                videoId, 
+                video_name, 
+                description, 
+                publishedAt, 
+                likeCount, 
+                id, 
+                parentId, 
+                pubs, 
+                channelId, 
+                match_term,
+                viewCount, 
+                vidLikeCount, 
+                likeToViewRatio) %>% 
+  write_csv(FINAL_CSV)
+
+```
+
